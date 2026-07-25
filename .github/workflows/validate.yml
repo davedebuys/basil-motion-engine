@@ -1,0 +1,22 @@
+name: Validate integration package
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate distribution
+        shell: pwsh
+        run: ./scripts/validate-package.ps1
+
+      - name: Check pinned Hermes patch
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git hermes-check
+          git -C hermes-check checkout f4df260f26c93f15694698869f3ea8e965eea301
+          ./scripts/install-hermes.ps1 -HermesPath ./hermes-check -Check

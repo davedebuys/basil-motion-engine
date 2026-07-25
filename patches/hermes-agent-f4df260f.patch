@@ -1,0 +1,2552 @@
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 4d7108d9f..1c69a9c9d 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -30,6 +30,11 @@ import {
+ } from 'electron'
+ import nodePty from 'node-pty'
+ 
++import {
++  constrainBasilDragEscortFrame,
++  deriveBasilDragCollaboration
++} from '../src/basil-motion/drag-collaboration-core.mjs'
++
+ import { stopBackendChild as stopBackendChildImpl } from './backend-child'
+ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
+ import { createBackendConnectionState } from './backend-connection-state'
+@@ -37,6 +42,35 @@ import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+ import { canImportHermesCli, verifyHermesCli } from './backend-probes'
+ import { waitForDashboardPortAnnouncement } from './backend-ready'
+ import { shouldLatchBackendStartFailure } from './backend-start-failure'
++import {
++  basilExternalTargetsShareSurface,
++  clampOverlayDestination,
++  externalTargetBelongsToApp,
++  overlaySurfaceTraversalFrame,
++  overlayTravelFrame,
++  parseWindowsAutomationLine,
++  placeOverlayBesideTarget,
++  planOverlayTravelRoute,
++  sampleOverlayTravelRoute,
++  shouldFollowBasilExternalFocus,
++  shouldFollowBasilExternalSelection,
++  shouldSuppressBasilExternalPreview,
++  surfaceProgressDestination,
++  surfaceTraversalDestination
++} from './basil-external-scene'
++import {
++  BasilForegroundDiscoveryGate,
++  shouldAcceptBasilForegroundDiscovery,
++  WINDOWS_UIA_FOREGROUND_DISCOVERY_SCRIPT
++} from './basil-foreground-discovery'
++import { WINDOWS_UIA_MONITOR_SCRIPT } from './basil-windows-uia'
++import {
++  basilWorkspaceEventMatchesTarget,
++  basilWorkspaceFollowIntent,
++  BasilWorkspaceTargetMemory,
++  shouldFollowBasilUserWorkspaceTarget,
++  shouldFollowBasilWorkspaceTarget
++} from './basil-workspace-memory'
+ import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
+ import { runBootstrap } from './bootstrap-runner'
+ import {
+@@ -7487,15 +7521,15 @@ function createInstanceWindow() {
+ // it. Control flows back (pop-in, composer submit) via hermes:pet-overlay:control.
+ let petOverlayWindow = null
+ 
+-function petOverlayUrl() {
++function mascotOverlayUrl(windowKind) {
+   if (DEV_SERVER) {
+-    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=overlay#/`
++    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=${windowKind}#/`
+   }
+ 
+-  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=overlay#/`
++  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=${windowKind}#/`
+ }
+ 
+-function spawnPetOverlayWindow(bounds) {
++function spawnMascotOverlayWindow(bounds, windowKind, onClosed) {
+   const win = new BrowserWindow({
+     width: Math.max(80, Math.round(bounds?.width || 220)),
+     height: Math.max(80, Math.round(bounds?.height || 220)),
+@@ -7572,21 +7606,26 @@ function spawnPetOverlayWindow(bounds) {
+     }
+   })
+ 
+-  win.on('closed', () => {
++  win.on('closed', onClosed)
++
++  win.loadURL(mascotOverlayUrl(windowKind))
++
++  return win
++}
++
++function spawnPetOverlayWindow(bounds) {
++  let win = null
++
++  win = spawnMascotOverlayWindow(bounds, 'overlay', () => {
+     if (petOverlayWindow === win) {
+       petOverlayWindow = null
+     }
+ 
+-    // If the overlay went away on its own (e.g. ⌘W), tell the main renderer to
+-    // pop the pet back in so it doesn't stay hidden. Harmless echo when we're
+-    // the ones who closed it (popInPet already cleared the active flag).
+     if (mainWindow && !mainWindow.isDestroyed()) {
+       mainWindow.webContents.send('hermes:pet-overlay:control', { type: 'pop-in' })
+     }
+   })
+ 
+-  win.loadURL(petOverlayUrl())
+-
+   return win
+ }
+ 
+@@ -7619,234 +7658,1391 @@ function closePetOverlay() {
+   petOverlayWindow = null
+ }
+ 
+-function createWindow() {
+-  const icon = getAppIconPath()
+-  const savedWindowState = readWindowState()
+-  mainWindow = new BrowserWindow({
+-    ...computeWindowOptions(savedWindowState, screen.getAllDisplays()),
+-    minWidth: WINDOW_MIN_WIDTH,
+-    minHeight: WINDOW_MIN_HEIGHT,
+-    title: 'Hermes',
+-    // Frameless title bar on every platform so the renderer can paint the
+-    // "hide sidebar" button (and other left-side titlebar tools) flush with
+-    // the top edge — matching the macOS layout where the traffic lights sit
+-    // inside the same band. On Windows/Linux, titleBarOverlay tells Electron
+-    // to paint native min/max/close in the top-right of the renderer; on
+-    // macOS it just reserves a content inset alongside the traffic lights.
+-    titleBarStyle: 'hidden',
+-    titleBarOverlay: getTitleBarOverlayOptions(),
+-    trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
+-    vibrancy: IS_MAC ? 'sidebar' : undefined,
+-    opacity: windowOpacity(),
+-    icon,
+-    // Hidden until the first themed paint so macOS `vibrancy` (which ignores
+-    // `backgroundColor` and follows the OS appearance) can't flash a light
+-    // material before the renderer paints the app theme. See createSessionWindow.
+-    show: false,
+-    backgroundColor: getWindowBackgroundColor(),
+-    // Shared with the secondary session windows (chatWindowWebPreferences) so
+-    // both keep `backgroundThrottling: false` — the chat transcript streams via
+-    // a requestAnimationFrame-gated flush that Chromium pauses for blurred
+-    // windows, stalling the live answer until refocus. See session-windows.ts.
+-    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+-  })
++// Independent Basil overlay. It shares the platform-safe mascot window shell
++// with Petdex but has its own renderer route, state stream, and lifecycle.
++let basilOverlayWindow = null
++let basilExternalSceneMonitor = null
++let basilExternalPreviewTimer = null
++let basilExternalDragReleaseTimer = null
++let basilExternalDragWindowSize: { height: number; width: number } | null = null
++let basilForegroundDiscoveryProcess = null
++let basilForegroundDiscoveryRequestId = 0
++let basilForegroundDiscoveryTimer = null
++let basilOverlayTravelTimer = null
++let basilOverlayTravelResolver = null
++let basilOverlayStatePayload = null
++let basilActiveExternalTarget = null
++let basilCurrentExternalTarget = null
++let basilSuppressedExternalPreviewPoint = null
++const basilWorkspaceTargetMemory = new BasilWorkspaceTargetMemory()
++const basilForegroundDiscoveryGate = new BasilForegroundDiscoveryGate()
+ 
+-  if (IS_MAC) {
+-    mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
++function stopBasilExternalPreview() {
++  if (basilExternalPreviewTimer) {
++    clearTimeout(basilExternalPreviewTimer)
++    basilExternalPreviewTimer = null
++  }
++}
+ 
+-    if (icon) {
+-      app.dock?.setIcon(icon)
+-    }
++function stopBasilExternalDragRelease() {
++  if (basilExternalDragReleaseTimer) {
++    clearTimeout(basilExternalDragReleaseTimer)
++    basilExternalDragReleaseTimer = null
+   }
++}
+ 
+-  if (!IS_MAC) {
+-    if (!nativeThemeListenerInstalled) {
+-      nativeThemeListenerInstalled = true
+-      nativeTheme.on('updated', () => {
+-        for (const win of BrowserWindow.getAllWindows()) {
+-          applyTitleBarOverlay(win)
+-        }
+-      })
+-    }
++function stopBasilExternalDragWindowLock() {
++  if (basilOverlayWindow && !basilOverlayWindow.isDestroyed() && basilOverlayWindow.isResizable()) {
++    basilOverlayWindow.setResizable(false)
+   }
+ 
+-  if (savedWindowState?.isMaximized) {
+-    mainWindow.maximize()
++  basilExternalDragWindowSize = null
++}
++
++function stopBasilOverlayTravel() {
++  if (basilOverlayTravelTimer) {
++    clearInterval(basilOverlayTravelTimer)
++    basilOverlayTravelTimer = null
+   }
+ 
+-  mainWindow.once('ready-to-show', () => {
+-    if (mainWindow && !mainWindow.isDestroyed()) {
+-      mainWindow.show()
++  if (basilOverlayTravelResolver) {
++    const resolve = basilOverlayTravelResolver
++
++    basilOverlayTravelResolver = null
++    resolve({
++      bounds: basilOverlayWindow && !basilOverlayWindow.isDestroyed() ? basilOverlayWindow.getBounds() : undefined,
++      ok: false
++    })
++  }
++}
++
++function stopBasilExternalSceneMonitor() {
++  stopBasilOverlayTravel()
++  stopBasilExternalPreview()
++  stopBasilExternalDragRelease()
++  stopBasilExternalDragWindowLock()
++  stopBasilForegroundDiscovery()
++  basilActiveExternalTarget = null
++  basilCurrentExternalTarget = null
++  basilSuppressedExternalPreviewPoint = null
++  basilWorkspaceTargetMemory.clear()
++  basilForegroundDiscoveryGate.clear()
++
++  if (basilExternalSceneMonitor) {
++    try {
++      basilExternalSceneMonitor.kill()
++    } catch {
++      void 0
+     }
++  }
+ 
+-    // Persist geometry as soon as the window is visible so a crash before the
+-    // first clean resize/move/close still captures the restored bounds (#56726).
+-    schedulePersistWindowState()
++  basilExternalSceneMonitor = null
++}
+ 
+-    // #38216: clear the mid-boot marker only after a window is actually usable.
+-    // Keep sticky `fallback` when we launched with --no-sandbox so the next
+-    // Start Menu click does not re-enter the GPU FATAL crash loop. The marker
+-    // records the app version so the next update re-probes the sandbox.
+-    if (IS_WINDOWS) {
++function hermesDesktopProcessIds() {
++  const processIds = [process.pid]
++
++  for (const win of BrowserWindow.getAllWindows()) {
++    if (!win.isDestroyed()) {
+       try {
+-        writeSandboxMarker(
+-          app.getPath('userData'),
+-          markerAfterSuccessfulBoot({
+-            fallbackActive: windowsSandboxFallbackSticky,
+-            reason: windowsSandboxFallbackReason,
+-            appVersion: app.getVersion()
+-          })
+-        )
+-      } catch (error) {
+-        rememberLog(`[sandbox] marker update after ready-to-show failed: ${error?.message || error}`)
++        processIds.push(win.webContents.getOSProcessId())
++      } catch {
++        void 0
+       }
+     }
++  }
++
++  return processIds
++}
++
++function publishBasilOverlayBounds(bounds) {
++  if (mainWindow && !mainWindow.isDestroyed()) {
++    mainWindow.webContents.send('hermes:basil-overlay:control', {
++      bounds,
++      type: 'bounds'
++    })
++  }
++}
++
++function publishBasilExternalTarget(target, phase, routeMotion = {}) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
++
++  const { obstacles: _obstacles, ...rendererTarget } = target
++
++  basilOverlayWindow.webContents.send('hermes:basil-overlay:external-target', {
++    ...rendererTarget,
++    ...routeMotion,
++    phase
+   })
++}
+ 
+-  // Under Playright testing, instantly show the window.
+-  // `ready-to-show` doesn't fire in some testing envs.
+-  if (process.env.TEST_WORKER_INDEX !== undefined) {
+-    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+-      mainWindow.show()
+-    }
++function landBasilOverlayAt(target, bounds, movementReason = 'visit') {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
+   }
+ 
+-  mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
+-  mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
+-  mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
+-  mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
++  publishBasilExternalTarget(target, 'landed', { movementReason })
++  publishBasilOverlayBounds(bounds)
++}
+ 
+-  // Reopen where the user left off. resized/moved settle once per drag; close is
+-  // the cross-platform backstop, flushed synchronously before the window is gone.
+-  mainWindow.on('resized', schedulePersistWindowState)
+-  mainWindow.on('moved', schedulePersistWindowState)
+-  mainWindow.on('maximize', schedulePersistWindowState)
+-  mainWindow.on('unmaximize', schedulePersistWindowState)
+-  mainWindow.on('close', () => schedulePersistWindowState.flush())
++function animateBasilOverlayNudge(request) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return Promise.resolve({ ok: false })
++  }
+ 
+-  // the closed wrapper remains truthy, so clear only the window this callback owns.
+-  const createdMainWindow = mainWindow
+-  mainWindow.on('closed', () => {
+-    closePetOverlay()
++  const requestedX = Number(request?.destination?.x)
++  const requestedY = Number(request?.destination?.y)
+ 
+-    if (mainWindow === createdMainWindow) {
+-      mainWindow = null
+-      // the replacement renderer must register before queued links can be delivered.
+-      _rendererReadyForDeepLink = false
+-    }
+-  })
++  if (!Number.isFinite(requestedX) || !Number.isFinite(requestedY)) {
++    return Promise.resolve({ bounds: basilOverlayWindow.getBounds(), ok: false })
++  }
+ 
+-  wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
++  stopBasilOverlayTravel()
++  stopBasilExternalPreview()
+ 
+-  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+-    rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)
++  const start = basilOverlayWindow.getBounds()
+ 
+-    if (details?.reason === 'crashed' || details?.reason === 'oom') {
+-      const now = Date.now()
+-      rendererReloadTimes = rendererReloadTimes.filter(t => now - t < RENDERER_RELOAD_WINDOW_MS)
++  const display = screen.getDisplayNearestPoint({
++    x: Math.round(requestedX + start.width / 2),
++    y: Math.round(requestedY + start.height / 2)
++  })
+ 
+-      if (rendererReloadTimes.length >= RENDERER_RELOAD_MAX) {
+-        rememberLog(
+-          `[renderer] suppressing reload: ${rendererReloadTimes.length} crashes within ${RENDERER_RELOAD_WINDOW_MS}ms (likely a crash loop)`
+-        )
++  const workArea = display.workArea
++  const destination = clampOverlayDestination({ x: requestedX, y: requestedY }, start, workArea)
++  const assistTarget = request?.reason === 'assist' ? basilCurrentExternalTarget : null
+ 
+-        // #38216 renderer flavor (same recovery as #56726, credit @Sahil-SS9):
+-        // a deterministic Windows renderer crash loop with the sandbox
+-        // breakpoint signature gets one --no-sandbox relaunch instead of a
+-        // dead window. Gated on the exit code so unrelated crash loops don't
+-        // silently drop the sandbox.
+-        if (
+-          shouldRelaunchForRendererSandboxCrashLoop({
+-            reason: details?.reason,
+-            exitCode: details?.exitCode,
+-            alreadyNoSandbox: windowsSandboxFallbackActive || alreadyHasNoSandbox(process.argv, process.env),
+-            relaunchAttempted: windowsNoSandboxRelaunchAttempted
+-          })
+-        ) {
+-          windowsNoSandboxRelaunchAttempted = true
+-          windowsSandboxFallbackActive = true
+-          windowsSandboxFallbackSticky = true
+-          windowsSandboxFallbackReason = 'renderer-crash-loop'
++  basilSuppressedExternalPreviewPoint = assistTarget ? screen.screenToDipPoint(screen.getCursorScreenPoint()) : null
+ 
+-          try {
+-            writeSandboxMarker(app.getPath('userData'), fallbackMarker('renderer-crash-loop', app.getVersion()))
+-          } catch {
+-            void 0
++  const targetInset = assistTarget
++    ? Math.min(6, assistTarget.bounds.width * 0.08, assistTarget.bounds.height * 0.08)
++    : 0
++
++  const route = assistTarget
++    ? planOverlayTravelRoute(
++        start,
++        destination,
++        workArea,
++        [
++          ...assistTarget.obstacles,
++          {
++            bounds: {
++              height: Math.max(12, assistTarget.bounds.height - targetInset * 2),
++              width: Math.max(12, assistTarget.bounds.width - targetInset * 2),
++              x: assistTarget.bounds.x + targetInset,
++              y: assistTarget.bounds.y + targetInset
++            },
++            processId: assistTarget.processId
+           }
++        ],
++        120,
++        16
++      )
++    : null
+ 
+-          rememberLog('[renderer] Windows sandbox crash loop detected; relaunching once with --no-sandbox (#38216)')
++  const distance = route?.distance ?? Math.hypot(destination.x - start.x, destination.y - start.y)
+ 
+-          try {
+-            app.relaunch({ args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+-            app.exit(0)
+-          } catch (err) {
+-            rememberLog(`[renderer] --no-sandbox relaunch failed: ${err?.message || err}`)
+-          }
+-        }
++  if (distance < 1) {
++    publishBasilOverlayBounds(destination)
++
++    return Promise.resolve({ bounds: destination, ok: true })
++  }
++
++  const duration = Math.min(520, Math.max(320, 200 + distance * 1.1))
++  const startedAt = Date.now()
++
++  return new Promise(resolve => {
++    basilOverlayTravelResolver = resolve
++    basilOverlayTravelTimer = setInterval(() => {
++      if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++        stopBasilOverlayTravel()
+ 
+         return
+       }
+ 
+-      rendererReloadTimes.push(now)
+-      setImmediate(() => {
+-        if (!mainWindow || mainWindow.isDestroyed()) {
+-          return
+-        }
++      const progress = Math.min(1, (Date.now() - startedAt) / duration)
+ 
+-        try {
+-          mainWindow.webContents.reload()
+-        } catch (err) {
+-          rememberLog(`[renderer] reload after crash failed: ${err?.message || err}`)
+-        }
+-      })
+-    }
++      const frame = route
++        ? sampleOverlayTravelRoute(route, progress).bounds
++        : overlayTravelFrame(start, destination, progress)
++
++      basilOverlayWindow.setBounds(frame)
++
++      if (progress >= 1) {
++        clearInterval(basilOverlayTravelTimer)
++        basilOverlayTravelTimer = null
++        basilOverlayTravelResolver = null
++        basilOverlayWindow.setBounds(destination)
++        publishBasilOverlayBounds(destination)
++        resolve({ bounds: destination, ok: true })
++      }
++    }, 16)
+   })
++}
+ 
+-  mainWindow.webContents.on('unresponsive', () => rememberLog('[renderer] webContents became unresponsive'))
++function traverseBasilOverlaySurface(target, start, destination, workArea, movementReason = 'visit') {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
+ 
+-  // Electron always passes the event first. The canonical (Electron 36+) shape
+-  // is (event, messageDetails); the deprecated positional shape is
+-  // (event, level, message, line, sourceId). Handle both. `level` is numeric
+-  // (0..3), where 3 === error.
+-  mainWindow.webContents.on('console-message', (_event, detailsOrLevel, message, line, sourceId) => {
+-    const details = detailsOrLevel && typeof detailsOrLevel === 'object' ? detailsOrLevel : null
+-    const level = details ? details.level : detailsOrLevel
++  const route = planOverlayTravelRoute(start, destination, workArea, target.obstacles, 120, 16)
++  const duration = Math.min(1300, Math.max(720, 480 + route.distance * 2.2))
++  const startedAt = Date.now()
++  const initial = sampleOverlayTravelRoute(route, 0)
++  let activeSegment = initial.segmentIndex
++
++  publishBasilExternalTarget(target, 'traverse', {
++    movementReason,
++    routeDirection: initial.direction,
++    routeStep: 0
++  })
++
++  basilOverlayTravelTimer = setInterval(() => {
++    if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++      stopBasilOverlayTravel()
+ 
+-    if (level !== 3) {
+       return
+     }
+ 
+-    const text = details ? details.message : message
+-    const src = details ? details.sourceUrl : sourceId
+-    const lineNo = details ? details.lineNumber : line
+-    rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
+-  })
++    const progress = Math.min(1, (Date.now() - startedAt) / duration)
++    const sample = sampleOverlayTravelRoute(route, progress)
+ 
+-  if (DEV_SERVER) {
+-    mainWindow.loadURL(DEV_SERVER)
+-  } else {
+-    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
+-  }
++    const frame =
++      route.obstructed && route.points.length > 2
++        ? sample.bounds
++        : overlaySurfaceTraversalFrame(start, destination, target.bounds, progress)
+ 
+-  // Start the Python backend NOW, in parallel with the renderer load — not on
+-  // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
+-  // is the dominant startup cost, and serializing it behind Chromium's load
+-  // added the whole renderer load time to first-usable-composer. The promise is
+-  // shared (backendConnectionState), so the renderer's getConnection() joins
+-  // this in-flight boot instead of duplicating it; early boot-progress events
+-  // the renderer misses are recovered by its getBootProgress() pull on mount.
+-  startHermes().catch(error => rememberLog(error.stack || error.message))
++    if (sample.segmentIndex !== activeSegment) {
++      activeSegment = sample.segmentIndex
++      publishBasilExternalTarget(target, 'traverse', {
++        movementReason,
++        routeDirection: sample.direction,
++        routeStep: sample.segmentIndex
++      })
++    }
+ 
+-  mainWindow.webContents.once('did-finish-load', () => {
+-    // Zoom restore is handled by wireCommonWindowHandlers (shared with session
+-    // windows); no need to reapply it here.
+-    broadcastBootProgress()
+-    sendWindowStateChanged()
+-  })
++    basilOverlayWindow.setBounds(frame)
++
++    if (progress >= 1) {
++      stopBasilOverlayTravel()
++      landBasilOverlayAt(target, destination, movementReason)
++    }
++  }, 16)
+ }
+ 
+-ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+-// Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
++function animateBasilOverlayTo(
++  target,
++  options: {
++    phase?: 'follow' | 'travel'
++    routeObstacles?: Array<{ bounds: { height: number; width: number; x: number; y: number }; processId: number }>
++    traverse?: boolean
++  } = {}
++) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
++
++  stopBasilOverlayTravel()
++  stopBasilExternalPreview()
++  basilSuppressedExternalPreviewPoint = null
++
++  const movementPhase = options.phase === 'follow' ? 'follow' : 'travel'
++  const movementReason = movementPhase === 'follow' ? 'follow' : 'visit'
++  const shouldTraverse = options.traverse !== false
++  basilActiveExternalTarget = target
++  basilCurrentExternalTarget = target
++
++  const start = basilOverlayWindow.getBounds()
++  const display = screen.getDisplayNearestPoint(target.point)
++  const destination = placeOverlayBesideTarget(target.bounds, start, display.workArea, 120, 16, target.point)
++
++  const route = planOverlayTravelRoute(
++    start,
++    destination,
++    display.workArea,
++    options.routeObstacles ??
++      (movementPhase === 'follow'
++        ? [...target.obstacles, { bounds: target.bounds, processId: target.processId }]
++        : target.obstacles),
++    120,
++    movementPhase === 'follow' ? 12 : 16
++  )
++
++  const duration = Math.min(1400, Math.max(260, 180 + route.distance * 0.52))
++  const startedAt = Date.now()
++  const initial = sampleOverlayTravelRoute(route, 0)
++  let activeSegment = initial.segmentIndex
++
++  publishBasilExternalTarget(target, movementPhase, {
++    movementReason,
++    routeDirection: initial.direction,
++    routeStep: 0
++  })
++
++  basilOverlayTravelTimer = setInterval(() => {
++    if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++      stopBasilOverlayTravel()
++
++      return
++    }
++
++    const progress = Math.min(1, (Date.now() - startedAt) / duration)
++    const sample = sampleOverlayTravelRoute(route, progress)
++
++    const frame =
++      route.obstructed && route.points.length > 2 ? sample.bounds : overlayTravelFrame(start, destination, progress)
++
++    if (sample.segmentIndex !== activeSegment) {
++      activeSegment = sample.segmentIndex
++      publishBasilExternalTarget(target, movementPhase, {
++        movementReason,
++        routeDirection: sample.direction,
++        routeStep: sample.segmentIndex
++      })
++    }
++
++    basilOverlayWindow.setBounds(frame)
++
++    if (progress >= 1) {
++      stopBasilOverlayTravel()
++      landBasilOverlayAt(target, destination, movementReason)
++
++      const traversalDestination = shouldTraverse
++        ? surfaceTraversalDestination(target.bounds, destination, display.workArea, target.target, target.point, 120)
++        : null
++
++      if (traversalDestination) {
++        basilOverlayTravelTimer = setTimeout(() => {
++          basilOverlayTravelTimer = null
++          traverseBasilOverlaySurface(target, destination, traversalDestination, display.workArea, movementReason)
++        }, 180)
++      }
++    }
++  }, 16)
++}
++
++function previewBasilExternalTarget(target) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed() || basilOverlayTravelTimer) {
++    return
++  }
++
++  stopBasilExternalPreview()
++  publishBasilExternalTarget(target, 'preview')
++
++  basilExternalPreviewTimer = setTimeout(() => {
++    basilExternalPreviewTimer = null
++
++    if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++      return
++    }
++
++    publishBasilExternalTarget(target, 'dismissed')
++  }, 1150)
++}
++
++function updateBasilExternalScroll(target) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
++
++  const currentTarget = basilCurrentExternalTarget
++  const progress = target.scrollY ?? target.scrollX
++
++  if (
++    !currentTarget ||
++    currentTarget.processId !== target.processId ||
++    currentTarget.target !== target.target ||
++    typeof progress !== 'number' ||
++    !Number.isFinite(progress)
++  ) {
++    return
++  }
++
++  if (basilWorkspaceFollowIntent(currentTarget, target) === 'resize') {
++    const refreshedTarget = basilWorkspaceTargetMemory.refresh(
++      {
++        ...target,
++        intent: 'refresh'
++      },
++      Date.now()
++    )
++
++    animateBasilOverlayTo(
++      {
++        ...currentTarget,
++        ...(refreshedTarget ?? target),
++        activationSource: currentTarget.activationSource,
++        intent: 'resize',
++        obstacles: currentTarget.obstacles
++      },
++      { phase: 'follow', traverse: false }
++    )
++
++    return
++  }
++
++  stopBasilOverlayTravel()
++  stopBasilExternalPreview()
++  stopBasilExternalDragRelease()
++  basilSuppressedExternalPreviewPoint = null
++
++  const start = basilOverlayWindow.getBounds()
++  const display = screen.getDisplayNearestPoint(target.point)
++
++  const placement = surfaceProgressDestination(target.bounds, start, display.workArea, progress, 120, 16)
++
++  const scrollTarget = {
++    ...currentTarget,
++    ...target,
++    activationSource: currentTarget.activationSource,
++    obstacles: currentTarget.obstacles,
++    point: placement.point
++  }
++
++  basilActiveExternalTarget = scrollTarget
++  basilCurrentExternalTarget = scrollTarget
++
++  const destination = placement.destination
++  const dx = destination.x - start.x
++  const dy = destination.y - start.y
++  const distance = Math.hypot(dx, dy)
++  const direction = distance > 0.01 ? { x: dx / distance, y: dy / distance } : { x: 0, y: 0 }
++
++  if (distance < 2) {
++    landBasilOverlayAt(scrollTarget, destination, 'follow')
++
++    return
++  }
++
++  const duration = Math.min(640, Math.max(260, 190 + distance * 1.25))
++  const startedAt = Date.now()
++
++  publishBasilExternalTarget(scrollTarget, 'follow', {
++    movementReason: 'follow',
++    routeDirection: direction,
++    routeStep: 0
++  })
++
++  basilOverlayTravelTimer = setInterval(() => {
++    if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++      stopBasilOverlayTravel()
++
++      return
++    }
++
++    const travelProgress = Math.min(1, (Date.now() - startedAt) / duration)
++
++    const frame = overlaySurfaceTraversalFrame(start, destination, target.bounds, travelProgress)
++
++    basilOverlayWindow.setBounds(frame)
++
++    if (travelProgress >= 1) {
++      stopBasilOverlayTravel()
++      landBasilOverlayAt(scrollTarget, destination, 'follow')
++    }
++  }, 16)
++}
++
++function updateBasilExternalFocus(target) {
++  const currentTarget = basilCurrentExternalTarget
++
++  if (!currentTarget || !shouldFollowBasilExternalFocus(currentTarget, target)) {
++    return
++  }
++
++  const focusTarget = {
++    ...target,
++    activationSource: 'keyboard',
++    obstacles: currentTarget.obstacles
++  }
++
++  basilWorkspaceTargetMemory.remember(
++    {
++      ...focusTarget,
++      intent: 'activate'
++    },
++    basilOverlayStatePayload,
++    Date.now()
++  )
++  animateBasilOverlayTo(focusTarget, { phase: 'follow', traverse: false })
++}
++
++function updateBasilExternalSelection(target) {
++  const currentTarget = basilCurrentExternalTarget
++
++  if (
++    !currentTarget ||
++    target.intent !== 'selection' ||
++    target.target === 'conversation' ||
++    target.target === 'terminal' ||
++    currentTarget.processId !== target.processId
++  ) {
++    return
++  }
++
++  const selectionTarget = {
++    ...target,
++    activationSource: 'selection',
++    obstacles: currentTarget.obstacles
++  }
++
++  if (!shouldFollowBasilExternalSelection(currentTarget, target)) {
++    basilActiveExternalTarget = selectionTarget
++    basilCurrentExternalTarget = selectionTarget
++    publishBasilExternalTarget(selectionTarget, 'activity', { movementReason: 'activity' })
++
++    return
++  }
++
++  basilWorkspaceTargetMemory.remember(
++    {
++      ...selectionTarget,
++      intent: 'activate'
++    },
++    basilOverlayStatePayload,
++    Date.now()
++  )
++  animateBasilOverlayTo(selectionTarget, {
++    phase: 'follow',
++    routeObstacles: [
++      ...selectionTarget.obstacles,
++      { bounds: selectionTarget.bounds, processId: selectionTarget.processId }
++    ],
++    traverse: false
++  })
++}
++
++function updateBasilExternalInput(target) {
++  if (
++    !basilOverlayWindow ||
++    basilOverlayWindow.isDestroyed() ||
++    basilOverlayTravelTimer ||
++    !basilCurrentExternalTarget ||
++    basilCurrentExternalTarget.processId !== target.processId ||
++    basilCurrentExternalTarget.target !== target.target
++  ) {
++    return
++  }
++
++  const inputTarget = {
++    ...basilCurrentExternalTarget,
++    ...target,
++    activationSource: 'content',
++    obstacles: basilCurrentExternalTarget.obstacles
++  }
++
++  basilActiveExternalTarget = inputTarget
++  basilCurrentExternalTarget = inputTarget
++  publishBasilExternalTarget(inputTarget, 'activity', { movementReason: 'activity' })
++}
++
++function updateBasilExternalAdjustment(target) {
++  if (
++    !basilOverlayWindow ||
++    basilOverlayWindow.isDestroyed() ||
++    basilOverlayTravelTimer ||
++    !basilCurrentExternalTarget ||
++    basilCurrentExternalTarget.processId !== target.processId ||
++    !['data', 'tool'].includes(target.target)
++  ) {
++    return
++  }
++
++  const controlTarget = {
++    ...basilCurrentExternalTarget,
++    ...target,
++    activationSource: 'control',
++    obstacles: basilCurrentExternalTarget.obstacles
++  }
++
++  basilActiveExternalTarget = controlTarget
++  basilCurrentExternalTarget = controlTarget
++  publishBasilExternalTarget(controlTarget, 'activity', { movementReason: 'activity' })
++}
++
++function updateBasilExternalInvocation(target) {
++  if (
++    !basilOverlayWindow ||
++    basilOverlayWindow.isDestroyed() ||
++    basilOverlayTravelTimer ||
++    !basilCurrentExternalTarget ||
++    basilCurrentExternalTarget.processId !== target.processId ||
++    basilCurrentExternalTarget.target !== target.target ||
++    !['tool', 'web'].includes(target.target)
++  ) {
++    return
++  }
++
++  const invocationTarget = {
++    ...basilCurrentExternalTarget,
++    ...target,
++    activationSource: 'invocation',
++    obstacles: basilCurrentExternalTarget.obstacles
++  }
++
++  basilActiveExternalTarget = invocationTarget
++  basilCurrentExternalTarget = invocationTarget
++  publishBasilExternalTarget(invocationTarget, 'activity', { movementReason: 'activity' })
++}
++
++function dismissBasilExternalTarget(target) {
++  const currentTarget = basilCurrentExternalTarget
++
++  if (
++    !basilOverlayWindow ||
++    basilOverlayWindow.isDestroyed() ||
++    !currentTarget ||
++    currentTarget.processId !== target.processId ||
++    currentTarget.target !== target.target
++  ) {
++    return
++  }
++
++  stopBasilOverlayTravel()
++  stopBasilExternalPreview()
++  stopBasilExternalDragRelease()
++  basilSuppressedExternalPreviewPoint = null
++
++  const dismissedTarget = {
++    ...currentTarget,
++    ...target,
++    activationSource: currentTarget.activationSource,
++    obstacles: currentTarget.obstacles
++  }
++
++  publishBasilExternalTarget(dismissedTarget, 'dismissed', { movementReason: 'activity' })
++  basilWorkspaceTargetMemory.forget(dismissedTarget)
++  basilActiveExternalTarget = null
++  basilCurrentExternalTarget = null
++}
++
++function updateBasilExternalStructure(target) {
++  if (
++    !basilOverlayWindow ||
++    basilOverlayWindow.isDestroyed() ||
++    basilOverlayTravelTimer ||
++    !basilCurrentExternalTarget ||
++    basilCurrentExternalTarget.processId !== target.processId ||
++    basilCurrentExternalTarget.target !== target.target ||
++    !['data', 'document', 'folder'].includes(target.target)
++  ) {
++    return
++  }
++
++  const collectionTarget = {
++    ...basilCurrentExternalTarget,
++    ...target,
++    activationSource: 'collection',
++    obstacles: basilCurrentExternalTarget.obstacles
++  }
++
++  basilActiveExternalTarget = collectionTarget
++  basilCurrentExternalTarget = collectionTarget
++  publishBasilExternalTarget(collectionTarget, 'activity', { movementReason: 'activity' })
++}
++
++function updateBasilExternalDrag(target) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
++
++  stopBasilExternalPreview()
++  stopBasilExternalDragRelease()
++  basilSuppressedExternalPreviewPoint = null
++
++  if (target.intent === 'drag_start') {
++    stopBasilOverlayTravel()
++    basilActiveExternalTarget = null
++    basilCurrentExternalTarget = target
++    const initialBounds = basilOverlayWindow.getBounds()
++
++    basilExternalDragWindowSize = {
++      height: initialBounds.height,
++      width: initialBounds.width
++    }
++    basilOverlayWindow.setResizable(true)
++  }
++
++  const currentBounds = basilOverlayWindow.getBounds()
++
++  const actor = {
++    ...currentBounds,
++    height: basilExternalDragWindowSize?.height ?? currentBounds.height,
++    width: basilExternalDragWindowSize?.width ?? currentBounds.width
++  }
++
++  const display = screen.getDisplayNearestPoint(target.point)
++
++  const phase = target.intent === 'drag_start' ? 'acquire' : target.intent === 'drag_end' ? 'release' : 'carry'
++
++  const collaboration = deriveBasilDragCollaboration({
++    actor,
++    distance: target.dragDistance ?? 0,
++    phase,
++    pointer: target.point,
++    target: target.target,
++    velocity: target.dragVelocity ?? { x: 0, y: 0 },
++    workArea: display.workArea
++  })
++
++  if (!collaboration.active) {
++    stopBasilExternalDragWindowLock()
++
++    return
++  }
++
++  if (phase !== 'release') {
++    const response = phase === 'acquire' ? 0.24 : 0.38
++
++    const destination = constrainBasilDragEscortFrame(
++      {
++        height: actor.height,
++        width: actor.width,
++        x: Math.round(actor.x + (collaboration.destination.x - actor.x) * response),
++        y: Math.round(actor.y + (collaboration.destination.y - actor.y) * response)
++      },
++      target.point,
++      display.workArea,
++      collaboration.velocity,
++      104
++    )
++
++    basilOverlayWindow.setBounds({
++      height: actor.height,
++      width: actor.width,
++      x: destination.x,
++      y: destination.y
++    })
++  }
++
++  publishBasilExternalTarget(target, phase === 'release' ? 'dropped' : 'dragging', {
++    collaboration,
++    movementReason: 'assist',
++    routeDirection: collaboration.velocity,
++    routeStep: 0
++  })
++
++  if (phase === 'release') {
++    stopBasilExternalDragWindowLock()
++    publishBasilOverlayBounds(basilOverlayWindow.getBounds())
++    basilExternalDragReleaseTimer = setTimeout(() => {
++      basilExternalDragReleaseTimer = null
++
++      if (!basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++        return
++      }
++
++      publishBasilExternalTarget(target, 'dismissed', {
++        collaboration,
++        movementReason: 'assist'
++      })
++      basilCurrentExternalTarget = null
++    }, 760)
++  }
++}
++
++function normalizeBasilWindowsTarget(rawTarget, activationSource) {
++  const point = screen.screenToDipPoint(rawTarget.point)
++  const ownedProcessIds = hermesDesktopProcessIds()
++
++  if (externalTargetBelongsToApp(rawTarget.processId, ownedProcessIds)) {
++    return null
++  }
++
++  const topLeft = screen.screenToDipPoint({ x: rawTarget.bounds.x, y: rawTarget.bounds.y })
++
++  const bottomRight = screen.screenToDipPoint({
++    x: rawTarget.bounds.x + rawTarget.bounds.width,
++    y: rawTarget.bounds.y + rawTarget.bounds.height
++  })
++
++  return {
++    ...rawTarget,
++    activationSource:
++      rawTarget.intent === 'activate' || rawTarget.intent.startsWith('drag_') ? activationSource : undefined,
++    bounds: {
++      height: Math.max(1, bottomRight.y - topLeft.y),
++      width: Math.max(1, bottomRight.x - topLeft.x),
++      x: topLeft.x,
++      y: topLeft.y
++    },
++    obstacles: rawTarget.obstacles
++      .filter(
++        obstacle =>
++          obstacle.processId !== rawTarget.processId && !externalTargetBelongsToApp(obstacle.processId, ownedProcessIds)
++      )
++      .map(obstacle => {
++        const obstacleTopLeft = screen.screenToDipPoint({
++          x: obstacle.bounds.x,
++          y: obstacle.bounds.y
++        })
++
++        const obstacleBottomRight = screen.screenToDipPoint({
++          x: obstacle.bounds.x + obstacle.bounds.width,
++          y: obstacle.bounds.y + obstacle.bounds.height
++        })
++
++        return {
++          bounds: {
++            height: Math.max(1, obstacleBottomRight.y - obstacleTopLeft.y),
++            width: Math.max(1, obstacleBottomRight.x - obstacleTopLeft.x),
++            x: obstacleTopLeft.x,
++            y: obstacleTopLeft.y
++          },
++          processId: obstacle.processId
++        }
++      }),
++    point
++  }
++}
++
++function handleWindowsAutomationLine(line) {
++  const rawTarget = parseWindowsAutomationLine(line)
++
++  if (!rawTarget || !basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
++
++  const target = normalizeBasilWindowsTarget(rawTarget, 'pointer')
++
++  if (!target) {
++    return
++  }
++
++  if (target.intent.startsWith('drag_')) {
++    updateBasilExternalDrag(target)
++  } else if (target.intent === 'dismiss') {
++    dismissBasilExternalTarget(target)
++  } else if (target.intent === 'structure') {
++    updateBasilExternalStructure(target)
++  } else if (target.intent === 'invocation') {
++    updateBasilExternalInvocation(target)
++  } else if (target.intent === 'adjustment') {
++    updateBasilExternalAdjustment(target)
++  } else if (target.intent === 'focus') {
++    updateBasilExternalFocus(target)
++  } else if (target.intent === 'selection') {
++    updateBasilExternalSelection(target)
++  } else if (target.intent === 'input') {
++    updateBasilExternalInput(target)
++  } else if (target.intent === 'scroll') {
++    updateBasilExternalScroll(target)
++  } else if (target.intent === 'refresh') {
++    stopBasilExternalDragWindowLock()
++    const activeTarget = basilActiveExternalTarget
++    const currentTarget = basilCurrentExternalTarget
++    const refreshedTarget = basilWorkspaceTargetMemory.refresh(target, Date.now())
++
++    if (shouldFollowBasilWorkspaceTarget(activeTarget, refreshedTarget, basilOverlayStatePayload)) {
++      animateBasilOverlayTo(
++        {
++          ...refreshedTarget,
++          activationSource: 'agent-event',
++          intent: basilWorkspaceFollowIntent(activeTarget, refreshedTarget)
++        },
++        { phase: 'follow', traverse: false }
++      )
++    } else if (shouldFollowBasilUserWorkspaceTarget(currentTarget, refreshedTarget)) {
++      animateBasilOverlayTo(
++        {
++          ...refreshedTarget,
++          activationSource: currentTarget.activationSource,
++          intent: basilWorkspaceFollowIntent(currentTarget, refreshedTarget)
++        },
++        { phase: 'follow', traverse: false }
++      )
++    }
++  } else if (target.intent === 'preview') {
++    stopBasilExternalDragWindowLock()
++
++    if (
++      basilExternalTargetsShareSurface(target, basilCurrentExternalTarget) ||
++      shouldSuppressBasilExternalPreview(target.point, basilSuppressedExternalPreviewPoint)
++    ) {
++      return
++    }
++
++    basilSuppressedExternalPreviewPoint = null
++    previewBasilExternalTarget(target)
++  } else {
++    stopBasilExternalDragWindowLock()
++    basilSuppressedExternalPreviewPoint = null
++    basilWorkspaceTargetMemory.remember(target, basilOverlayStatePayload, Date.now())
++    animateBasilOverlayTo(target)
++  }
++}
++
++function stopBasilForegroundDiscovery() {
++  basilForegroundDiscoveryRequestId += 1
++
++  if (basilForegroundDiscoveryTimer) {
++    clearTimeout(basilForegroundDiscoveryTimer)
++    basilForegroundDiscoveryTimer = null
++  }
++
++  if (basilForegroundDiscoveryProcess) {
++    const child = basilForegroundDiscoveryProcess
++
++    basilForegroundDiscoveryProcess = null
++
++    try {
++      child.kill()
++    } catch {
++      void 0
++    }
++  }
++}
++
++function discoverBasilForegroundTarget(request) {
++  if (!IS_WINDOWS || !basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++    return
++  }
++
++  stopBasilForegroundDiscovery()
++  const requestId = basilForegroundDiscoveryRequestId + 1
++
++  basilForegroundDiscoveryRequestId = requestId
++
++  const child = spawn(
++    'powershell.exe',
++    [
++      '-NoProfile',
++      '-NonInteractive',
++      '-ExecutionPolicy',
++      'Bypass',
++      '-Command',
++      WINDOWS_UIA_FOREGROUND_DISCOVERY_SCRIPT
++    ],
++    { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }
++  )
++
++  let output = ''
++
++  basilForegroundDiscoveryProcess = child
++  child.stdout.setEncoding('utf8')
++  child.stdout.on('data', chunk => {
++    output += chunk
++  })
++
++  basilForegroundDiscoveryTimer = setTimeout(() => {
++    if (basilForegroundDiscoveryProcess === child) {
++      basilForegroundDiscoveryProcess = null
++
++      try {
++        child.kill()
++      } catch {
++        void 0
++      }
++    }
++  }, 2500)
++
++  child.on('close', () => {
++    if (basilForegroundDiscoveryProcess === child) {
++      basilForegroundDiscoveryProcess = null
++    }
++
++    if (basilForegroundDiscoveryTimer) {
++      clearTimeout(basilForegroundDiscoveryTimer)
++      basilForegroundDiscoveryTimer = null
++    }
++
++    if (requestId !== basilForegroundDiscoveryRequestId || !basilOverlayWindow || basilOverlayWindow.isDestroyed()) {
++      return
++    }
++
++    const line = output
++      .split(/\r?\n/)
++      .map(value => value.trim())
++      .find(Boolean)
++
++    const rawTarget = line ? parseWindowsAutomationLine(line) : null
++    const target = rawTarget ? normalizeBasilWindowsTarget(rawTarget, 'agent-event') : null
++
++    if (
++      !target ||
++      !shouldAcceptBasilForegroundDiscovery({
++        activeTarget: basilActiveExternalTarget,
++        currentPayload: basilOverlayStatePayload,
++        discoveredTarget: target,
++        ownedProcessIds: hermesDesktopProcessIds(),
++        request
++      })
++    ) {
++      return
++    }
++
++    basilWorkspaceTargetMemory.remember(target, basilOverlayStatePayload, Date.now())
++    animateBasilOverlayTo(target)
++  })
++}
++
++function startBasilExternalSceneMonitor() {
++  if (!IS_WINDOWS || basilExternalSceneMonitor) {
++    return
++  }
++
++  const scriptPath = path.join(app.getPath('temp'), `hermes-basil-uia-${process.pid}-${Date.now()}.ps1`)
++
++  try {
++    fs.writeFileSync(scriptPath, WINDOWS_UIA_MONITOR_SCRIPT, 'utf8')
++  } catch (error) {
++    rememberLog(
++      `[basil] Windows UI Automation script write failed: ${error instanceof Error ? error.message : String(error)}`
++    )
++
++    return
++  }
++
++  const child = spawn(
++    'powershell.exe',
++    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
++    { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }
++  )
++
++  let output = ''
++
++  basilExternalSceneMonitor = child
++  child.stdout.setEncoding('utf8')
++  child.stdout.on('data', chunk => {
++    output += chunk
++    const lines = output.split(/\r?\n/)
++    output = lines.pop() || ''
++    lines.forEach(handleWindowsAutomationLine)
++  })
++  child.stderr.setEncoding('utf8')
++  child.stderr.on('data', chunk => {
++    const message = String(chunk || '').trim()
++
++    if (message) {
++      rememberLog(`[basil] Windows UI Automation listener: ${message.slice(0, 240)}`)
++    }
++  })
++  child.on('error', error => {
++    rememberLog(`[basil] Windows UI Automation listener failed: ${error.message}`)
++  })
++  child.on('close', () => {
++    try {
++      fs.rmSync(scriptPath, { force: true })
++    } catch {
++      void 0
++    }
++
++    if (basilExternalSceneMonitor === child) {
++      basilExternalSceneMonitor = null
++    }
++  })
++}
++
++function spawnBasilOverlayWindow(bounds) {
++  let win = null
++
++  win = spawnMascotOverlayWindow(bounds, 'basil-overlay', () => {
++    if (basilOverlayWindow === win) {
++      basilOverlayWindow = null
++    }
++
++    stopBasilExternalSceneMonitor()
++
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      mainWindow.webContents.send('hermes:basil-overlay:control', { type: 'pop-in' })
++    }
++  })
++
++  return win
++}
++
++function setBasilOverlayBounds(bounds) {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed() || !bounds) {
++    return
++  }
++
++  const nextBounds = {
++    height: Math.max(80, Math.round(bounds.height)),
++    width: Math.max(80, Math.round(bounds.width)),
++    x: Math.round(bounds.x),
++    y: Math.round(bounds.y)
++  }
++
++  const currentBounds = basilOverlayWindow.getBounds()
++
++  const resizing = currentBounds.height !== nextBounds.height || currentBounds.width !== nextBounds.width
++
++  const wasResizable = basilOverlayWindow.isResizable()
++
++  if (resizing && !wasResizable) {
++    basilOverlayWindow.setResizable(true)
++  }
++
++  basilOverlayWindow.setBounds(nextBounds)
++
++  if (resizing && !wasResizable) {
++    basilOverlayWindow.setResizable(false)
++  }
++}
++
++function openBasilOverlay(bounds) {
++  if (basilOverlayWindow && !basilOverlayWindow.isDestroyed()) {
++    if (bounds) {
++      setBasilOverlayBounds(bounds)
++    }
++
++    basilOverlayWindow.showInactive()
++
++    if (basilOverlayStatePayload?.presence?.phase !== 'hidden') {
++      startBasilExternalSceneMonitor()
++    }
++
++    return basilOverlayWindow
++  }
++
++  basilOverlayWindow = spawnBasilOverlayWindow(bounds)
++
++  if (basilOverlayStatePayload?.presence?.phase !== 'hidden') {
++    startBasilExternalSceneMonitor()
++  }
++
++  return basilOverlayWindow
++}
++
++function closeBasilOverlay() {
++  stopBasilExternalSceneMonitor()
++
++  if (basilOverlayWindow && !basilOverlayWindow.isDestroyed()) {
++    basilOverlayWindow.close()
++  }
++
++  basilOverlayWindow = null
++}
++
++function createWindow() {
++  const icon = getAppIconPath()
++  const savedWindowState = readWindowState()
++  mainWindow = new BrowserWindow({
++    ...computeWindowOptions(savedWindowState, screen.getAllDisplays()),
++    minWidth: WINDOW_MIN_WIDTH,
++    minHeight: WINDOW_MIN_HEIGHT,
++    title: 'Hermes',
++    // Frameless title bar on every platform so the renderer can paint the
++    // "hide sidebar" button (and other left-side titlebar tools) flush with
++    // the top edge — matching the macOS layout where the traffic lights sit
++    // inside the same band. On Windows/Linux, titleBarOverlay tells Electron
++    // to paint native min/max/close in the top-right of the renderer; on
++    // macOS it just reserves a content inset alongside the traffic lights.
++    titleBarStyle: 'hidden',
++    titleBarOverlay: getTitleBarOverlayOptions(),
++    trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
++    vibrancy: IS_MAC ? 'sidebar' : undefined,
++    opacity: windowOpacity(),
++    icon,
++    // Hidden until the first themed paint so macOS `vibrancy` (which ignores
++    // `backgroundColor` and follows the OS appearance) can't flash a light
++    // material before the renderer paints the app theme. See createSessionWindow.
++    show: false,
++    backgroundColor: getWindowBackgroundColor(),
++    // Shared with the secondary session windows (chatWindowWebPreferences) so
++    // both keep `backgroundThrottling: false` — the chat transcript streams via
++    // a requestAnimationFrame-gated flush that Chromium pauses for blurred
++    // windows, stalling the live answer until refocus. See session-windows.ts.
++    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
++  })
++
++  if (IS_MAC) {
++    mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
++
++    if (icon) {
++      app.dock?.setIcon(icon)
++    }
++  }
++
++  if (!IS_MAC) {
++    if (!nativeThemeListenerInstalled) {
++      nativeThemeListenerInstalled = true
++      nativeTheme.on('updated', () => {
++        for (const win of BrowserWindow.getAllWindows()) {
++          applyTitleBarOverlay(win)
++        }
++      })
++    }
++  }
++
++  if (savedWindowState?.isMaximized) {
++    mainWindow.maximize()
++  }
++
++  mainWindow.once('ready-to-show', () => {
++    if (mainWindow && !mainWindow.isDestroyed()) {
++      mainWindow.show()
++    }
++
++    // Persist geometry as soon as the window is visible so a crash before the
++    // first clean resize/move/close still captures the restored bounds (#56726).
++    schedulePersistWindowState()
++
++    // #38216: clear the mid-boot marker only after a window is actually usable.
++    // Keep sticky `fallback` when we launched with --no-sandbox so the next
++    // Start Menu click does not re-enter the GPU FATAL crash loop. The marker
++    // records the app version so the next update re-probes the sandbox.
++    if (IS_WINDOWS) {
++      try {
++        writeSandboxMarker(
++          app.getPath('userData'),
++          markerAfterSuccessfulBoot({
++            fallbackActive: windowsSandboxFallbackSticky,
++            reason: windowsSandboxFallbackReason,
++            appVersion: app.getVersion()
++          })
++        )
++      } catch (error) {
++        rememberLog(`[sandbox] marker update after ready-to-show failed: ${error?.message || error}`)
++      }
++    }
++  })
++
++  // Under Playright testing, instantly show the window.
++  // `ready-to-show` doesn't fire in some testing envs.
++  if (process.env.TEST_WORKER_INDEX !== undefined) {
++    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
++      mainWindow.show()
++    }
++  }
++
++  mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
++  mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
++  mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
++  mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
++
++  // Reopen where the user left off. resized/moved settle once per drag; close is
++  // the cross-platform backstop, flushed synchronously before the window is gone.
++  mainWindow.on('resized', schedulePersistWindowState)
++  mainWindow.on('moved', schedulePersistWindowState)
++  mainWindow.on('maximize', schedulePersistWindowState)
++  mainWindow.on('unmaximize', schedulePersistWindowState)
++  mainWindow.on('close', () => schedulePersistWindowState.flush())
++
++  // the closed wrapper remains truthy, so clear only the window this callback owns.
++  const createdMainWindow = mainWindow
++  mainWindow.on('closed', () => {
++    closePetOverlay()
++
++    if (mainWindow === createdMainWindow) {
++      mainWindow = null
++      // the replacement renderer must register before queued links can be delivered.
++      _rendererReadyForDeepLink = false
++    }
++  })
++
++  wireCommonWindowHandlers(mainWindow, zoomWiringForWindowKind('chat'))
++
++  mainWindow.webContents.on('render-process-gone', (_event, details) => {
++    rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)
++
++    if (details?.reason === 'crashed' || details?.reason === 'oom') {
++      const now = Date.now()
++      rendererReloadTimes = rendererReloadTimes.filter(t => now - t < RENDERER_RELOAD_WINDOW_MS)
++
++      if (rendererReloadTimes.length >= RENDERER_RELOAD_MAX) {
++        rememberLog(
++          `[renderer] suppressing reload: ${rendererReloadTimes.length} crashes within ${RENDERER_RELOAD_WINDOW_MS}ms (likely a crash loop)`
++        )
++
++        // #38216 renderer flavor (same recovery as #56726, credit @Sahil-SS9):
++        // a deterministic Windows renderer crash loop with the sandbox
++        // breakpoint signature gets one --no-sandbox relaunch instead of a
++        // dead window. Gated on the exit code so unrelated crash loops don't
++        // silently drop the sandbox.
++        if (
++          shouldRelaunchForRendererSandboxCrashLoop({
++            reason: details?.reason,
++            exitCode: details?.exitCode,
++            alreadyNoSandbox: windowsSandboxFallbackActive || alreadyHasNoSandbox(process.argv, process.env),
++            relaunchAttempted: windowsNoSandboxRelaunchAttempted
++          })
++        ) {
++          windowsNoSandboxRelaunchAttempted = true
++          windowsSandboxFallbackActive = true
++          windowsSandboxFallbackSticky = true
++          windowsSandboxFallbackReason = 'renderer-crash-loop'
++
++          try {
++            writeSandboxMarker(app.getPath('userData'), fallbackMarker('renderer-crash-loop', app.getVersion()))
++          } catch {
++            void 0
++          }
++
++          rememberLog('[renderer] Windows sandbox crash loop detected; relaunching once with --no-sandbox (#38216)')
++
++          try {
++            app.relaunch({ args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
++            app.exit(0)
++          } catch (err) {
++            rememberLog(`[renderer] --no-sandbox relaunch failed: ${err?.message || err}`)
++          }
++        }
++
++        return
++      }
++
++      rendererReloadTimes.push(now)
++      setImmediate(() => {
++        if (!mainWindow || mainWindow.isDestroyed()) {
++          return
++        }
++
++        try {
++          mainWindow.webContents.reload()
++        } catch (err) {
++          rememberLog(`[renderer] reload after crash failed: ${err?.message || err}`)
++        }
++      })
++    }
++  })
++
++  mainWindow.webContents.on('unresponsive', () => rememberLog('[renderer] webContents became unresponsive'))
++
++  // Electron always passes the event first. The canonical (Electron 36+) shape
++  // is (event, messageDetails); the deprecated positional shape is
++  // (event, level, message, line, sourceId). Handle both. `level` is numeric
++  // (0..3), where 3 === error.
++  mainWindow.webContents.on('console-message', (_event, detailsOrLevel, message, line, sourceId) => {
++    const details = detailsOrLevel && typeof detailsOrLevel === 'object' ? detailsOrLevel : null
++    const level = details ? details.level : detailsOrLevel
++
++    if (level !== 3) {
++      return
++    }
++
++    const text = details ? details.message : message
++    const src = details ? details.sourceUrl : sourceId
++    const lineNo = details ? details.lineNumber : line
++    rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
++  })
++
++  if (DEV_SERVER) {
++    mainWindow.loadURL(DEV_SERVER)
++  } else {
++    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
++  }
++
++  // Start the Python backend NOW, in parallel with the renderer load — not on
++  // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
++  // is the dominant startup cost, and serializing it behind Chromium's load
++  // added the whole renderer load time to first-usable-composer. The promise is
++  // shared (backendConnectionState), so the renderer's getConnection() joins
++  // this in-flight boot instead of duplicating it; early boot-progress events
++  // the renderer misses are recovered by its getBootProgress() pull on mount.
++  startHermes().catch(error => rememberLog(error.stack || error.message))
++
++  mainWindow.webContents.once('did-finish-load', () => {
++    // Zoom restore is handled by wireCommonWindowHandlers (shared with session
++    // windows); no need to reapply it here.
++    broadcastBootProgress()
++    sendWindowStateChanged()
++  })
++}
++
++ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
++// Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
+ // so the 'exit'/'error' handlers that would clear a dead connection promise never
+ // fire — once the remote becomes unreachable across a sleep/wake the renderer
+ // re-dials the same dead descriptor forever and the composer stays stuck on
+@@ -8040,6 +9236,110 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
+ 
+   mainWindow.webContents.send('hermes:pet-overlay:control', payload)
+ })
++
++// --- Basil overlay (procedural screen actor) ------------------------------
++ipcMain.handle('hermes:basil-overlay:open', async (_event, request) => {
++  const bounds = request && request.bounds ? request.bounds : request
++  const isScreen = Boolean(request && request.screen)
++  let screenBounds = bounds
++
++  try {
++    if (bounds && !isScreen && mainWindow && !mainWindow.isDestroyed()) {
++      const content = mainWindow.getContentBounds()
++      screenBounds = {
++        x: content.x + (bounds.x || 0),
++        y: content.y + (bounds.y || 0),
++        width: bounds.width,
++        height: bounds.height
++      }
++    }
++  } catch {
++    // Fall back to renderer-relative bounds if screen conversion is unavailable.
++  }
++
++  openBasilOverlay(screenBounds)
++
++  return { ok: true, bounds: screenBounds }
++})
++ipcMain.handle('hermes:basil-overlay:close', async () => {
++  closeBasilOverlay()
++
++  return { ok: true }
++})
++ipcMain.handle('hermes:basil-overlay:cursor-point', async () => screen.screenToDipPoint(screen.getCursorScreenPoint()))
++ipcMain.handle('hermes:basil-overlay:nudge', async (_event, request) => animateBasilOverlayNudge(request))
++ipcMain.on('hermes:basil-overlay:nudge-cancel', () => {
++  if (basilOverlayTravelResolver) {
++    stopBasilOverlayTravel()
++  }
++})
++ipcMain.on('hermes:basil-overlay:set-bounds', (_event, bounds) => {
++  if (!basilOverlayWindow || basilOverlayWindow.isDestroyed() || !bounds) {
++    return
++  }
++
++  stopBasilOverlayTravel()
++  setBasilOverlayBounds(bounds)
++})
++ipcMain.on('hermes:basil-overlay:ignore-mouse', (_event, ignore) => {
++  if (basilOverlayWindow && !basilOverlayWindow.isDestroyed()) {
++    basilOverlayWindow.setIgnoreMouseEvents(Boolean(ignore), { forward: true })
++  }
++})
++ipcMain.on('hermes:basil-overlay:state', (_event, payload) => {
++  const previousPresencePhase = basilOverlayStatePayload?.presence?.phase
++
++  basilOverlayStatePayload = payload
++
++  if (basilOverlayWindow && !basilOverlayWindow.isDestroyed()) {
++    basilOverlayWindow.webContents.send('hermes:basil-overlay:state', payload)
++
++    const nextPresencePhase = payload?.presence?.phase
++
++    if (nextPresencePhase !== previousPresencePhase) {
++      if (nextPresencePhase === 'hidden') {
++        stopBasilExternalSceneMonitor()
++      } else {
++        startBasilExternalSceneMonitor()
++      }
++    }
++
++    if (basilActiveExternalTarget && !basilWorkspaceEventMatchesTarget(payload, basilActiveExternalTarget)) {
++      basilActiveExternalTarget = null
++    }
++
++    const discoveryRequest = basilForegroundDiscoveryGate.next(payload)
++    const rememberedTarget = basilWorkspaceTargetMemory.consume(payload, Date.now())
++
++    if (rememberedTarget) {
++      animateBasilOverlayTo({
++        ...rememberedTarget,
++        activationSource: 'agent-event',
++        intent: 'activate'
++      })
++    } else if (discoveryRequest && !basilActiveExternalTarget) {
++      discoverBasilForegroundTarget(discoveryRequest)
++    }
++  }
++})
++ipcMain.on('hermes:basil-overlay:control', (_event, payload) => {
++  if (!mainWindow || mainWindow.isDestroyed()) {
++    return
++  }
++
++  if (payload && payload.type === 'toggle-app') {
++    if (mainWindow.isMinimized() || !mainWindow.isVisible()) {
++      mainWindow.show()
++      mainWindow.focus()
++    } else {
++      mainWindow.minimize()
++    }
++
++    return
++  }
++
++  mainWindow.webContents.send('hermes:basil-overlay:control', payload)
++})
+ ipcMain.handle('hermes:bootstrap:reset', async () => {
+   // Renderer's "Reload and retry" path. Clear the latched failure and
+   // reset connection state so the next startHermes() call restarts the
+@@ -9824,6 +11124,7 @@ app.on('before-quit', () => {
+   // The always-on-top overlay isn't a "real" app window; close it so a stray
+   // pet can't keep the process alive or float over a quit app.
+   closePetOverlay()
++  closeBasilOverlay()
+ 
+   // Quitting mid-install should stop the installer, not orphan it.
+   if (bootstrapAbortController) {
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 37f068ca9..21f41047e 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -36,6 +36,35 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+       return () => ipcRenderer.removeListener('hermes:pet-overlay:control', listener)
+     }
+   },
++  basilOverlay: {
++    open: request => ipcRenderer.invoke('hermes:basil-overlay:open', request),
++    close: () => ipcRenderer.invoke('hermes:basil-overlay:close'),
++    cancelNudge: () => ipcRenderer.send('hermes:basil-overlay:nudge-cancel'),
++    getCursorPoint: () => ipcRenderer.invoke('hermes:basil-overlay:cursor-point'),
++    nudge: request => ipcRenderer.invoke('hermes:basil-overlay:nudge', request),
++    setBounds: bounds => ipcRenderer.send('hermes:basil-overlay:set-bounds', bounds),
++    setIgnoreMouse: ignore => ipcRenderer.send('hermes:basil-overlay:ignore-mouse', ignore),
++    pushState: payload => ipcRenderer.send('hermes:basil-overlay:state', payload),
++    control: payload => ipcRenderer.send('hermes:basil-overlay:control', payload),
++    onState: callback => {
++      const listener = (_event, payload) => callback(payload)
++      ipcRenderer.on('hermes:basil-overlay:state', listener)
++
++      return () => ipcRenderer.removeListener('hermes:basil-overlay:state', listener)
++    },
++    onControl: callback => {
++      const listener = (_event, payload) => callback(payload)
++      ipcRenderer.on('hermes:basil-overlay:control', listener)
++
++      return () => ipcRenderer.removeListener('hermes:basil-overlay:control', listener)
++    },
++    onExternalTarget: callback => {
++      const listener = (_event, payload) => callback(payload)
++      ipcRenderer.on('hermes:basil-overlay:external-target', listener)
++
++      return () => ipcRenderer.removeListener('hermes:basil-overlay:external-target', listener)
++    }
++  },
+   getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
+   getConnectionConfig: profile => ipcRenderer.invoke('hermes:connection-config:get', profile),
+   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts b/apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts
+index 5ce92171d..a0b5ce227 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-composer-voice.ts
+@@ -1,5 +1,6 @@
+ import { useCallback, useEffect, useRef, useState } from 'react'
+ 
++import { handleHermesBasilPresenceTranscript } from '@/basil-motion/adapters/hermes-presence-command'
+ import { useI18n } from '@/i18n'
+ import { chatMessageText } from '@/lib/chat-messages'
+ import { triggerHaptic } from '@/lib/haptics'
+@@ -53,10 +54,19 @@ export function useComposerVoice({
+   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
+   const lastSpokenIdRef = useRef<string | null>(null)
+ 
++  const handleDictationTranscript = useCallback(
++    (text: string) => {
++      if (!handleHermesBasilPresenceTranscript(text)) {
++        insertText(text)
++      }
++    },
++    [insertText]
++  )
++
+   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
+     focusInput,
+     maxRecordingSeconds,
+-    onTranscript: insertText,
++    onTranscript: handleDictationTranscript,
+     onTranscribeAudio
+   })
+ 
+@@ -91,14 +101,20 @@ export function useComposerVoice({
+   }
+ 
+   const submitVoiceTurn = async (text: string) => {
++    if (handleHermesBasilPresenceTranscript(text)) {
++      return false
++    }
++
+     if (busy) {
+-      return
++      return false
+     }
+ 
+     triggerHaptic('submit')
+     resetBrowseState(sessionId)
+     clearDraft()
+     await onSubmit(text)
++
++    return true
+   }
+ 
+   const conversation = useVoiceConversation({
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-mic-recorder.ts b/apps/desktop/src/app/chat/composer/hooks/use-mic-recorder.ts
+index 5389d9f4d..350094438 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-mic-recorder.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-mic-recorder.ts
+@@ -1,11 +1,17 @@
+ import { useEffect, useRef, useState } from 'react'
+ 
++import { acquireMicrophoneLease, ownsMicrophoneLease, releaseMicrophoneLease } from '@/lib/microphone-lease'
++
+ type BrowserAudioContext = typeof AudioContext
+ 
+ export interface MicRecorderOptions {
++  leasePriority?: number
++  levelPublishIntervalMs?: number
+   onLevel?: (level: number) => void
+   onError?: (error: Error) => void
++  onPreempt?: () => void
+   onSilence?: () => void
++  sampleIntervalMs?: number
+   silenceLevel?: number
+   silenceMs?: number
+   idleSilenceMs?: number
+@@ -72,11 +78,14 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+   const chunksRef = useRef<Blob[]>([])
+   const audioContextRef = useRef<AudioContext | null>(null)
+   const animationRef = useRef<number | null>(null)
++  const meterTimerRef = useRef<number | null>(null)
+   const startedAtRef = useRef(0)
+   const heardSpeechRef = useRef(false)
+   const silenceTriggeredRef = useRef(false)
+   const silenceStartedAtRef = useRef<number | null>(null)
++  const lastLevelPublishAtRef = useRef(0)
+   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
++  const leaseIdRef = useRef(Symbol('microphone-recorder'))
+ 
+   const cleanup = () => {
+     if (animationRef.current) {
+@@ -84,11 +93,17 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+       animationRef.current = null
+     }
+ 
++    if (meterTimerRef.current) {
++      window.clearTimeout(meterTimerRef.current)
++      meterTimerRef.current = null
++    }
++
+     void audioContextRef.current?.close()
+     audioContextRef.current = null
+     streamRef.current?.getTracks().forEach(track => track.stop())
+     streamRef.current = null
+     recorderRef.current = null
++    releaseMicrophoneLease(leaseIdRef.current)
+     setLevel(0)
+     setRecording(false)
+     silenceTriggeredRef.current = false
+@@ -129,8 +144,13 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+         const normalized = Math.min(1, rms / 42)
+         const now = Date.now()
+ 
+-        setLevel(normalized)
+-        options.onLevel?.(normalized)
++        const publishInterval = Math.max(16, options.levelPublishIntervalMs ?? 50)
++
++        if (now - lastLevelPublishAtRef.current >= publishInterval) {
++          lastLevelPublishAtRef.current = now
++          setLevel(normalized)
++          options.onLevel?.(normalized)
++        }
+ 
+         const speechThreshold = options.silenceLevel ?? 0
+         const silenceMs = options.silenceMs ?? 0
+@@ -157,7 +177,11 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+           }
+         }
+ 
+-        animationRef.current = window.requestAnimationFrame(tick)
++        if (options.sampleIntervalMs && options.sampleIntervalMs > 0) {
++          meterTimerRef.current = window.setTimeout(tick, Math.max(16, options.sampleIntervalMs))
++        } else {
++          animationRef.current = window.requestAnimationFrame(tick)
++        }
+       }
+ 
+       tick()
+@@ -175,12 +199,43 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+       throw new Error(copy.microphoneUnsupported)
+     }
+ 
++    const acquired = acquireMicrophoneLease({
++      id: leaseIdRef.current,
++      onPreempt: () => {
++        const recorder = recorderRef.current
++        const resolver = stopResolverRef.current
++
++        stopResolverRef.current = null
++
++        if (recorder && recorder.state !== 'inactive') {
++          recorder.ondataavailable = null
++          recorder.onerror = null
++          recorder.onstop = null
++          recorder.stop()
++        }
++
++        cleanup()
++        resolver?.(null)
++        options.onPreempt?.()
++      },
++      priority: options.leasePriority ?? 10
++    })
++
++    if (!acquired) {
++      throw new Error(copy.microphoneInUse)
++    }
++
+     const permitted = await window.hermesDesktop?.requestMicrophoneAccess?.()
+ 
+     if (permitted === false) {
++      releaseMicrophoneLease(leaseIdRef.current)
+       throw new Error(copy.microphoneAccessDenied)
+     }
+ 
++    if (!ownsMicrophoneLease(leaseIdRef.current)) {
++      throw new Error(copy.microphoneInUse)
++    }
++
+     let stream: MediaStream
+ 
+     try {
+@@ -188,9 +243,15 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+         audio: { echoCancellation: true, noiseSuppression: true }
+       })
+     } catch (error) {
++      releaseMicrophoneLease(leaseIdRef.current)
+       throw micError(error, copy)
+     }
+ 
++    if (!ownsMicrophoneLease(leaseIdRef.current)) {
++      stream.getTracks().forEach(track => track.stop())
++      throw new Error(copy.microphoneInUse)
++    }
++
+     const mimeType =
+       ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg', 'audio/wav'].find(
+         type => MediaRecorder.isTypeSupported(type)
+@@ -202,6 +263,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+       recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+     } catch (error) {
+       stream.getTracks().forEach(track => track.stop())
++      releaseMicrophoneLease(leaseIdRef.current)
+       throw micError(error, copy)
+     }
+ 
+@@ -212,6 +274,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
+     silenceTriggeredRef.current = false
+     silenceStartedAtRef.current = null
+     startedAtRef.current = Date.now()
++    lastLevelPublishAtRef.current = 0
+ 
+     recorder.ondataavailable = event => {
+       if (event.data.size > 0) {
+diff --git a/apps/desktop/src/app/chat/composer/hooks/use-voice-conversation.ts b/apps/desktop/src/app/chat/composer/hooks/use-voice-conversation.ts
+index a8725cac6..0ae681f38 100644
+--- a/apps/desktop/src/app/chat/composer/hooks/use-voice-conversation.ts
++++ b/apps/desktop/src/app/chat/composer/hooks/use-voice-conversation.ts
+@@ -18,7 +18,7 @@ interface VoiceConversationOptions {
+   busy: boolean
+   enabled: boolean
+   onFatalError?: () => void
+-  onSubmit: (text: string) => Promise<void> | void
++  onSubmit: (text: string) => Promise<boolean | void> | boolean | void
+   onTranscribeAudio?: (audio: Blob) => Promise<string>
+   pendingResponse: () => PendingVoiceResponse | null
+   consumePendingResponse: () => void
+@@ -166,9 +166,22 @@ export function useVoiceConversation({
+             return
+           }
+ 
++          const submitted = await onSubmit(transcript)
++
++          if (submitted === false) {
++            awaitingSpokenResponseRef.current = false
++
++            if (enabledRef.current && !mutedRef.current && !busyRef.current) {
++              pendingStartRef.current = true
++            }
++
++            setStatus('idle')
++
++            return
++          }
++
+           awaitingSpokenResponseRef.current = true
+           resetSpeechBuffer()
+-          await onSubmit(transcript)
+           setStatus('thinking')
+         } catch (error) {
+           notifyError(error, voiceCopy.transcriptionFailed)
+diff --git a/apps/desktop/src/app/contrib/wiring.tsx b/apps/desktop/src/app/contrib/wiring.tsx
+index 40e65ad0e..ee764c206 100644
+--- a/apps/desktop/src/app/contrib/wiring.tsx
++++ b/apps/desktop/src/app/contrib/wiring.tsx
+@@ -13,6 +13,7 @@ import { useQueryClient } from '@tanstack/react-query'
+ import { type CSSProperties, lazy, type ReactNode, Suspense, useCallback, useEffect, useMemo, useRef } from 'react'
+ import { useLocation, useNavigate } from 'react-router-dom'
+ 
++import { BasilMotionController } from '@/basil-motion/basil-motion-controller'
+ import { formatRefValue } from '@/components/assistant-ui/directive-text'
+ import { BootFailureOverlay } from '@/components/boot-failure-overlay'
+ import { DesktopInstallOverlay } from '@/components/desktop-install-overlay'
+@@ -971,6 +972,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
+ 
+       {/* Petdex floating mascot — renders nothing unless installed + enabled. */}
+       <FloatingPet />
++      <BasilMotionController />
+ 
+       {/* Single persistent xterm host chasing the terminal pane's slot rect. */}
+       <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 89a14d443..96ebff8cc 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -1,5 +1,14 @@
+ import type { GatewayWsUrlResult } from '@hermes/shared'
+ 
++import type {
++    BasilOverlayBounds,
++    BasilOverlayControl,
++    BasilOverlayExternalTarget,
++    BasilOverlayNudgeRequest,
++    BasilOverlayNudgeResult,
++    BasilOverlayOpenRequest,
++  BasilOverlayStatePayload
++} from './basil-motion/basil-overlay'
+ import type {
+   PetOverlayBounds,
+   PetOverlayControl,
+@@ -55,6 +64,20 @@ declare global {
+         onState: (callback: (payload: PetOverlayStatePayload) => void) => () => void
+         onControl: (callback: (payload: PetOverlayControl) => void) => () => void
+       }
++      basilOverlay: {
++        open: (request: BasilOverlayOpenRequest) => Promise<{ bounds?: BasilOverlayBounds; ok: boolean }>
++        close: () => Promise<{ ok: boolean }>
++        cancelNudge: () => void
++        getCursorPoint: () => Promise<{ x: number; y: number }>
++        nudge: (request: BasilOverlayNudgeRequest) => Promise<BasilOverlayNudgeResult>
++        setBounds: (bounds: BasilOverlayBounds) => void
++        setIgnoreMouse: (ignore: boolean) => void
++        pushState: (payload: BasilOverlayStatePayload) => void
++        control: (payload: BasilOverlayControl) => void
++        onState: (callback: (payload: BasilOverlayStatePayload) => void) => () => void
++        onControl: (callback: (payload: BasilOverlayControl) => void) => () => void
++        onExternalTarget: (callback: (payload: BasilOverlayExternalTarget) => void) => () => void
++      }
+       getBootProgress: () => Promise<DesktopBootProgress>
+       getConnectionConfig: (profile?: null | string) => Promise<DesktopConnectionConfig>
+       saveConnectionConfig: (payload: DesktopConnectionConfigInput) => Promise<DesktopConnectionConfig>
+diff --git a/apps/desktop/src/hermes.test.ts b/apps/desktop/src/hermes.test.ts
+index f829471c5..b3a2f7ab3 100644
+--- a/apps/desktop/src/hermes.test.ts
++++ b/apps/desktop/src/hermes.test.ts
+@@ -7,6 +7,7 @@ import {
+   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
+   audioSpeakRequestTimeoutMs,
+   audioTranscribeRequestTimeoutMs,
++  classifyBasilPresenceAudio,
+   getCronJobs,
+   getGlobalModelInfo,
+   getGlobalModelOptions,
+@@ -20,7 +21,8 @@ import {
+   listSidebarSessions,
+   resetSidebarBatchCapability,
+   speakText,
+-  transcribeAudio
++  transcribeAudio,
++  warmBasilPresenceAudioPrefilter
+ } from './hermes'
+ import { refreshActiveProfile } from './store/profile'
+ 
+@@ -386,6 +388,51 @@ describe('Hermes REST helpers', () => {
+     })
+   })
+ 
++  it('uses the local Basil presence prefilter endpoint without a long STT timeout', async () => {
++    api.mockResolvedValueOnce({
++      available: true,
++      candidate: false,
++      ok: true,
++      processing_ms: 12.5,
++      provider: 'pocketsphinx',
++      reason: 'rejected'
++    })
++
++    await expect(classifyBasilPresenceAudio('data:audio/webm;base64,AA==', 'audio/webm')).resolves.toEqual({
++      available: true,
++      candidate: false,
++      ok: true,
++      processing_ms: 12.5,
++      provider: 'pocketsphinx',
++      reason: 'rejected'
++    })
++
++    expect(api).toHaveBeenCalledWith({
++      body: { data_url: 'data:audio/webm;base64,AA==', mime_type: 'audio/webm' },
++      method: 'POST',
++      path: '/api/audio/basil-presence-candidate',
++      timeoutMs: 30_000
++    })
++  })
++
++  it('warms the optional local Basil prefilter without blocking microphone setup', async () => {
++    api.mockResolvedValueOnce({
++      available: true,
++      candidate: false,
++      ok: true,
++      processing_ms: 320,
++      provider: 'pocketsphinx',
++      reason: 'ready'
++    })
++
++    await warmBasilPresenceAudioPrefilter()
++
++    expect(api).toHaveBeenCalledWith({
++      path: '/api/audio/basil-presence-prefilter',
++      timeoutMs: 30_000
++    })
++  })
++
+   it('defaults model options to configured providers only', async () => {
+     await getGlobalModelOptions()
+ 
+diff --git a/apps/desktop/src/hermes.ts b/apps/desktop/src/hermes.ts
+index a3d4199fa..1ec4ef34c 100644
+--- a/apps/desktop/src/hermes.ts
++++ b/apps/desktop/src/hermes.ts
+@@ -4,6 +4,7 @@ import type {
+   ActionResponse,
+   ActionStatusResponse,
+   AnalyticsResponse,
++  AudioPresenceCandidateResponse,
+   AudioSpeakResponse,
+   AudioTranscriptionResponse,
+   AuxiliaryModelsResponse,
+@@ -124,6 +125,7 @@ export type {
+   AnalyticsSkillEntry,
+   AnalyticsSkillsSummary,
+   AnalyticsTotals,
++  AudioPresenceCandidateResponse,
+   AudioSpeakResponse,
+   AudioTranscriptionResponse,
+   AuxiliaryModelsResponse,
+@@ -1384,6 +1386,28 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
+   })
+ }
+ 
++export function classifyBasilPresenceAudio(
++  dataUrl: string,
++  mimeType?: string
++): Promise<AudioPresenceCandidateResponse> {
++  return window.hermesDesktop.api<AudioPresenceCandidateResponse>({
++    path: '/api/audio/basil-presence-candidate',
++    method: 'POST',
++    body: {
++      data_url: dataUrl,
++      mime_type: mimeType
++    },
++    timeoutMs: 30_000
++  })
++}
++
++export function warmBasilPresenceAudioPrefilter(): Promise<AudioPresenceCandidateResponse> {
++  return window.hermesDesktop.api<AudioPresenceCandidateResponse>({
++    path: '/api/audio/basil-presence-prefilter',
++    timeoutMs: 30_000
++  })
++}
++
+ export function speakText(text: string): Promise<AudioSpeakResponse> {
+   return window.hermesDesktop.api<AudioSpeakResponse>({
+     path: '/api/audio/speak',
+diff --git a/apps/desktop/src/main.tsx b/apps/desktop/src/main.tsx
+index b1dd65765..7b736c682 100644
+--- a/apps/desktop/src/main.tsx
++++ b/apps/desktop/src/main.tsx
+@@ -25,8 +25,18 @@ if (import.meta.env.MODE !== 'production' || import.meta.env.VITE_PERF_PROBE ===
+   import('./app/chat/perf-probe')
+ }
+ 
+-if (new URLSearchParams(window.location.search).get('win') === 'overlay') {
++const windowKind = new URLSearchParams(window.location.search).get('win')
++
++if (windowKind === 'overlay') {
+   void import('./app/pet-overlay/overlay-root').then(({ mountPetOverlay }) => mountPetOverlay())
++} else if (windowKind === 'basil-overlay') {
++  void import('./basil-motion/basil-overlay-root').then(({ mountBasilOverlay }) => mountBasilOverlay())
++} else if (windowKind === 'basil-tour') {
++  void import('./basil-motion/basil-tour-root').then(({ mountBasilTour }) => mountBasilTour())
++} else if (windowKind === 'basil-personality') {
++  void import('./basil-motion/basil-personality-root').then(({ mountBasilPersonalityShowcase }) =>
++    mountBasilPersonalityShowcase()
++  )
+ } else {
+   createRoot(document.getElementById('root')!).render(
+     <StrictMode>
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index 86a87dbf0..803c3c2c8 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -30,7 +30,7 @@
+   font-style: normal;
+   font-weight: 700;
+   font-display: swap;
+-  src: url('../../../node_modules/@nous-research/ui/dist/fonts/Collapse-Bold.woff2') format('woff2');
++  src: url('../node_modules/@nous-research/ui/dist/fonts/Collapse-Bold.woff2') format('woff2');
+ }
+ 
+ /* JetBrains Mono — bundled terminal font (Apache-2.0) so bold/italic share the
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index fcfae5cf7..3352fa05b 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -16,6 +16,15 @@ export interface AudioTranscriptionResponse {
+   transcript: string
+ }
+ 
++export interface AudioPresenceCandidateResponse {
++  available: boolean
++  candidate: boolean
++  ok: boolean
++  processing_ms: number
++  provider: null | string
++  reason: string
++}
++
+ export interface AudioSpeakResponse {
+   ok: boolean
+   data_url: string
+diff --git a/pyproject.toml b/pyproject.toml
+index c630b3cf7..9dfc7a677 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -174,6 +174,7 @@ voice = [
+   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime),
+   # so keep it out of the base install for source-build packagers like Homebrew.
+   "faster-whisper==1.2.1",
++  "pocketsphinx==5.1.1",
+   "sounddevice==0.5.5",
+   "numpy==2.4.3",
+ ]
+diff --git a/tests/hermes_cli/test_web_server.py b/tests/hermes_cli/test_web_server.py
+index 404a06ae8..09f491e5d 100644
+--- a/tests/hermes_cli/test_web_server.py
++++ b/tests/hermes_cli/test_web_server.py
+@@ -2230,17 +2230,85 @@ class TestWebServerEndpoints:
+         assert resp.status_code == 400
+         assert "base64" in resp.json()["detail"]
+ 
++    def test_basil_presence_prefilter_endpoint(self, monkeypatch):
++        import hermes_cli.basil_speech_prefilter as speech_prefilter
++
++        captured = {}
++
++        def fake_classify(path):
++            captured["path"] = path
++            return {
++                "available": True,
++                "candidate": False,
++                "processing_ms": 4.25,
++                "provider": "test-prefilter",
++                "reason": "rejected",
++            }
++
++        monkeypatch.setattr(
++            speech_prefilter, "classify_basil_speech_candidate", fake_classify
++        )
++
++        resp = self.client.post(
++            "/api/audio/basil-presence-candidate",
++            json={
++                "data_url": "data:audio/webm;base64,aGVsbG8=",
++                "mime_type": "audio/webm",
++            },
++        )
++
++        assert resp.status_code == 200
++        assert resp.json() == {
++            "ok": True,
++            "available": True,
++            "candidate": False,
++            "processing_ms": 4.25,
++            "provider": "test-prefilter",
++            "reason": "rejected",
++        }
++        assert captured["path"].endswith(".webm")
++        assert not Path(captured["path"]).exists()
++
++    def test_basil_presence_prefilter_warmup_endpoint(self, monkeypatch):
++        import hermes_cli.basil_speech_prefilter as speech_prefilter
++
++        monkeypatch.setattr(
++            speech_prefilter,
++            "warm_basil_speech_prefilter",
++            lambda: {
++                "available": True,
++                "candidate": False,
++                "processing_ms": 21.5,
++                "provider": "test-prefilter",
++                "reason": "ready",
++            },
++        )
++
++        resp = self.client.get("/api/audio/basil-presence-prefilter")
++
++        assert resp.status_code == 200
++        assert resp.json() == {
++            "ok": True,
++            "available": True,
++            "candidate": False,
++            "processing_ms": 21.5,
++            "provider": "test-prefilter",
++            "reason": "ready",
++        }
++
+     def test_desktop_audio_routes_registered(self):
+-        """All three desktop voice endpoints must exist.
++        """All desktop voice endpoints must exist.
+ 
+-        The renderer (apps/desktop) calls /api/audio/transcribe, /speak, and
+-        /elevenlabs/voices. /speak + /voices were silently dropped in a merge
+-        once; this guards the contract so a future merge can't lose them
++        The renderer (apps/desktop) calls the prefilter, /transcribe, /speak,
++        and /elevenlabs/voices. /speak + /voices were silently dropped in a
++        merge once; this guards the contract so a future merge can't lose them
+         without failing CI.
+         """
+         from hermes_cli.web_server import app
+ 
+         paths = {getattr(r, "path", None) for r in app.routes}
++        assert "/api/audio/basil-presence-candidate" in paths
++        assert "/api/audio/basil-presence-prefilter" in paths
+         assert "/api/audio/transcribe" in paths
+         assert "/api/audio/speak" in paths
+         assert "/api/audio/elevenlabs/voices" in paths
+diff --git a/uv.lock b/uv.lock
+index 257f7d696..3ef669143 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1715,6 +1715,7 @@ vertex = [
+ voice = [
+     { name = "faster-whisper" },
+     { name = "numpy" },
++    { name = "pocketsphinx" },
+     { name = "sounddevice" },
+ ]
+ web = [
+@@ -1811,6 +1812,7 @@ requires-dist = [
+     { name = "parallel-web", marker = "extra == 'parallel-web'", specifier = "==0.4.2" },
+     { name = "pathspec", specifier = "==1.1.1" },
+     { name = "pillow", specifier = "==12.2.0" },
++    { name = "pocketsphinx", marker = "extra == 'voice'", specifier = "==5.1.1" },
+     { name = "prompt-toolkit", specifier = "==3.0.52" },
+     { name = "psutil", specifier = "==7.2.2" },
+     { name = "ptyprocess", marker = "sys_platform != 'win32'", specifier = ">=0.7.0,<1" },
+@@ -3022,6 +3024,29 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+ ]
+ 
++[[package]]
++name = "pocketsphinx"
++version = "5.1.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "sounddevice" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/61/e7/13e0e787ff467218de880310d79cba14424f13b87171ac44af0bde1e428c/pocketsphinx-5.1.1.tar.gz", hash = "sha256:675778b309a22dfc9b7d37f7621976bba491d2a5f8c59696bd77fd6d07271355", size = 34158862, upload-time = "2026-06-06T17:33:13.04Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2a/cf/1493946809382b0d60319fe338efb5141173ec58eb9ab5ca8c211d7cae4f/pocketsphinx-5.1.1-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:8cd1ae6f236c2d1941643d87b9136317f628878892fbcb873ab2795f715144d3", size = 29499393, upload-time = "2026-06-06T17:32:09.571Z" },
++    { url = "https://files.pythonhosted.org/packages/95/56/e0da7c96e3af9b0fbca3db46a9a6c5389642ec17ff4a7fb1cde592db023b/pocketsphinx-5.1.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4742dc42c010caf5a2558cac910b0856d85c94e9bb0357ed4ff32f1f0d0837f9", size = 29144458, upload-time = "2026-06-06T17:32:14.126Z" },
++    { url = "https://files.pythonhosted.org/packages/74/34/d9db696560de8ea7347f630630b9f9e988093dc52ff02ea6bf1b6d41f21c/pocketsphinx-5.1.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bb8fd0fc7fb08dd8f85da21f5121f34ebf4186a5bee91ce85e2d358e69a448bf", size = 29167744, upload-time = "2026-06-06T17:32:18.784Z" },
++    { url = "https://files.pythonhosted.org/packages/49/94/8d3beb892983cc44098a93ffd54241047902c347accb991669029497943f/pocketsphinx-5.1.1-cp311-cp311-musllinux_1_2_aarch64.whl", hash = "sha256:b29b014241edce4437a55b8743a3156deb0d383c919e923eac099e2fb16f8c14", size = 29151201, upload-time = "2026-06-06T17:32:24.036Z" },
++    { url = "https://files.pythonhosted.org/packages/93/21/5b75e1487b98de1442ffbcb2df704beedf22905011d40c3cc1d99ebb76f0/pocketsphinx-5.1.1-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:00fc4a43cbb2d2620557603c9d1d6a1d54998b13e1406d449a5d674a5309893c", size = 29170373, upload-time = "2026-06-06T17:32:29.3Z" },
++    { url = "https://files.pythonhosted.org/packages/70/f3/a44c87be7e434866bf575c343fddc8f2b61065f831c747dd6af3d3702f21/pocketsphinx-5.1.1-cp311-cp311-win_amd64.whl", hash = "sha256:08e4d5cc7377932dae2e55191b34f9939d73bf2401046ca2bd03be6daf21ac3b", size = 29052812, upload-time = "2026-06-06T17:32:34.249Z" },
++    { url = "https://files.pythonhosted.org/packages/06/e1/c2820011a5a1c8931f50d9add2af4591a0f531b2d810bc0fe1bf048079ef/pocketsphinx-5.1.1-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:8de78671858278dbe97bf9578ea25a70ac2162d49a3218155c874058ba4554fc", size = 29501688, upload-time = "2026-06-06T17:32:39.47Z" },
++    { url = "https://files.pythonhosted.org/packages/20/9f/74d921c7338dbd7cd40609b0a1b5e7a5e5a2acd23aaa2f6004fb729639cc/pocketsphinx-5.1.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:c6741bebbec5a10d08971bd2fdc0a6c1f876ad20a27f73c598e81654612794d6", size = 29130736, upload-time = "2026-06-06T17:32:44.849Z" },
++    { url = "https://files.pythonhosted.org/packages/d1/32/630fb5b204d354fbf408218e8c9019354d33c70d0b647eb52f8d4d0ab86e/pocketsphinx-5.1.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:38ff34e47b35f0caa1b58939806c4ab86c234a13536299c8c929a3cb45761941", size = 29163925, upload-time = "2026-06-06T17:32:49.841Z" },
++    { url = "https://files.pythonhosted.org/packages/17/cc/082f70632d6474052cace9c4cc4b0ce8666eb4b52553187b05d15c0e65d6/pocketsphinx-5.1.1-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:9328118d15c150b88885d79765e663f3c42a3601bb8c15e9ff42f44428b10d61", size = 29138503, upload-time = "2026-06-06T17:32:54.276Z" },
++    { url = "https://files.pythonhosted.org/packages/6a/f5/b29391d051323e95f3408b2400f459f6e86e5b8449bfd38f80eb18bb3e63/pocketsphinx-5.1.1-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:0ffe854397b11546a9f629472367c8b668583a5ebfefbc129a80875e0ec70bee", size = 29166295, upload-time = "2026-06-06T17:33:00.642Z" },
++    { url = "https://files.pythonhosted.org/packages/43/d3/2ba1b70b1995f298bdc2430e78d40bb989fe390f685153c59513692e67bd/pocketsphinx-5.1.1-cp313-cp313-win_amd64.whl", hash = "sha256:2ba7e6789a67119f581b85d156e523cd1876af5d30ebacbf7ed3cd85f61ec382", size = 29038645, upload-time = "2026-06-06T17:33:07.553Z" },
++]
++
+ [[package]]
+ name = "portalocker"
+ version = "3.2.0"
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 8995f1847..95a2ba185 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -3918,8 +3918,9 @@ async def check_hermes_update(force: bool = False):
+     return payload
+ 
+ 
+-@app.post("/api/audio/transcribe")
+-async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
++def _decode_desktop_audio_payload(
++    payload: AudioTranscriptionRequest,
++) -> tuple[bytes, str]:
+     data_url = (payload.data_url or "").strip()
+     if not data_url.startswith("data:") or "," not in data_url:
+         raise HTTPException(status_code=400, detail="Invalid audio payload")
+@@ -3952,6 +3953,51 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
+     if len(audio_bytes) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
+         raise HTTPException(status_code=413, detail="Audio recording is too large")
+ 
++    return audio_bytes, mime_type
++
++
++@app.post("/api/audio/basil-presence-candidate")
++async def classify_basil_presence_audio(payload: AudioTranscriptionRequest):
++    audio_bytes, mime_type = _decode_desktop_audio_payload(payload)
++    temp_path = ""
++    try:
++        suffix = _audio_extension_for_mime(mime_type)
++        with tempfile.NamedTemporaryFile(
++            prefix="hermes-basil-presence-",
++            suffix=suffix,
++            delete=False,
++        ) as tmp:
++            tmp.write(audio_bytes)
++            temp_path = tmp.name
++
++        from hermes_cli.basil_speech_prefilter import (
++            classify_basil_speech_candidate,
++        )
++
++        result = await asyncio.to_thread(
++            classify_basil_speech_candidate, temp_path
++        )
++    finally:
++        if temp_path:
++            try:
++                os.unlink(temp_path)
++            except OSError:
++                pass
++
++    return {"ok": True, **result}
++
++
++@app.get("/api/audio/basil-presence-prefilter")
++async def warm_basil_presence_prefilter():
++    from hermes_cli.basil_speech_prefilter import warm_basil_speech_prefilter
++
++    result = await asyncio.to_thread(warm_basil_speech_prefilter)
++    return {"ok": True, **result}
++
++
++@app.post("/api/audio/transcribe")
++async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
++    audio_bytes, mime_type = _decode_desktop_audio_payload(payload)
+     temp_path = ""
+     try:
+         suffix = _audio_extension_for_mime(mime_type)

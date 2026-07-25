@@ -1,0 +1,14 @@
+{
+  "name": "basil-motion-engine",
+  "version": "0.1.0",
+  "license": "MIT",
+  "renderer": "procedural-svg",
+  "audio": "procedural-web-audio",
+  "states": 12,
+  "interactions": 100,
+  "personalityBehaviours": 20,
+  "hermes": {
+    "repository": "https://github.com/NousResearch/hermes-agent",
+    "baselineCommit": "f4df260f26c93f15694698869f3ea8e965eea301"
+  }
+}
