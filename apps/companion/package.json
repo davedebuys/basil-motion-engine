@@ -1,0 +1,35 @@
+{
+  "name": "basil-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Basil Companion - a floating desktop pet with a chat and dashboard panel",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/electron/main.js",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run build:electron && vite build",
+    "build:electron": "node scripts/bundle-electron-main.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "electron dist/electron/main.js"
+  },
+  "dependencies": {
+    "@nanostores/react": "^2.0.1",
+    "nanostores": "^1.5.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "electron": "^43.7.0",
+    "esbuild": "^0.28.2",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  }
+}

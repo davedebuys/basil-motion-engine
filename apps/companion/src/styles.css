@@ -1,0 +1,58 @@
+@import 'tailwindcss';
+
+/*
+ * Minimal theme surface for the vendored Basil engine. The engine's JSX leans
+ * on a few Hermes-named utilities (`text-foreground`, `--ui-bg-elevated`,
+ * `--ui-stroke-secondary`, `z-60`). Define them here so the vendored files
+ * render correctly without pulling in the whole Hermes theme stack.
+ */
+@theme {
+  --color-foreground: #eceef0;
+  --color-muted-foreground: #9aa2ab;
+  --color-ring: #6b7280;
+  --ui-stroke-secondary: #2a2d31;
+  --ui-bg-elevated: #16181b;
+  --ui-bg-hover: #22262b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The overlay window must never paint a backdrop. */
+body[data-window='overlay'] {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+/* The panel is a real, opaque surface. */
+body[data-window='panel'] {
+  background: #0d0f12;
+  color: var(--color-foreground);
+  overflow: hidden;
+  user-select: none;
+}
+
+.panel-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #2a2d31 transparent;
+}
+
+.panel-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.panel-scroll::-webkit-scrollbar-thumb {
+  background: #2a2d31;
+  border-radius: 3px;
+}
